@@ -60,6 +60,8 @@ int test_memio_write_cb(WOLFSSL *ssl, char *data, int sz, void *ctx)
         msg_sizes = test_ctx->c_msg_sizes;
         msg_count = &test_ctx->c_msg_count;
         forceWantWrite = &test_ctx->s_force_want_write;
+        if (test_ctx->s_max_write > 0 && sz > test_ctx->s_max_write)
+            sz = test_ctx->s_max_write;
     }
     else {
         buf = test_ctx->s_buff;
@@ -67,6 +69,8 @@ int test_memio_write_cb(WOLFSSL *ssl, char *data, int sz, void *ctx)
         msg_sizes = test_ctx->s_msg_sizes;
         msg_count = &test_ctx->s_msg_count;
         forceWantWrite = &test_ctx->c_force_want_write;
+        if (test_ctx->c_max_write > 0 && sz > test_ctx->c_max_write)
+            sz = test_ctx->c_max_write;
     }
 
     if (*forceWantWrite)
@@ -118,6 +122,8 @@ int test_memio_read_cb(WOLFSSL *ssl, char *data, int sz, void *ctx)
         msg_sizes = test_ctx->s_msg_sizes;
         msg_count = &test_ctx->s_msg_count;
         msg_pos = &test_ctx->s_msg_pos;
+        if (test_ctx->s_max_read > 0 && sz > test_ctx->s_max_read)
+            sz = test_ctx->s_max_read;
     }
     else {
         buf = test_ctx->c_buff;
@@ -125,6 +131,8 @@ int test_memio_read_cb(WOLFSSL *ssl, char *data, int sz, void *ctx)
         msg_sizes = test_ctx->c_msg_sizes;
         msg_count = &test_ctx->c_msg_count;
         msg_pos = &test_ctx->c_msg_pos;
+        if (test_ctx->c_max_read > 0 && sz > test_ctx->c_max_read)
+            sz = test_ctx->c_max_read;
     }
 
     if (*len == 0 || *msg_pos >= *msg_count)

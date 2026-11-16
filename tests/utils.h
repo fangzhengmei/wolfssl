@@ -85,6 +85,16 @@ struct test_memio_ctx
     int c_force_want_write;
     int s_force_want_write;
 
+    /* Short I/O simulation: when > 0, caps the number of bytes a single
+     * read or write callback invocation moves for that side, so records
+     * are split across many short reads/writes. 0 (the default) means
+     * unlimited. c_* applies to the client WOLFSSL object, s_* to the
+     * server one. */
+    int c_max_read;
+    int s_max_read;
+    int c_max_write;
+    int s_max_write;
+
     /* Transport keeps a byte stream rather than datagrams (DTLS over SCTP),
      * so a partial read must not drop the rest of the message. */
     byte sctp;

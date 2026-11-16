@@ -44574,6 +44574,725 @@ static int test_write_dup_negotiate_pha(void)
     return EXPECT_RESULT();
 }
 
+/* -------------------------------------------------------------------------
+ * TLS 1.3 KeyUpdate record-layer consistency.
+ *
+ * test_tls13_key_update_short_io drives a TLS 1.3 client and server over
+ * the in-memory transport with short reads/writes (records are split
+ * across many callback invocations) and verifies that KeyUpdate - sender
+ * initiated, peer requested, repeated and back-to-back - keeps both ends
+ * on identical traffic secrets, keys and record sequence numbers, that
+ * pending output is neither lost nor sent under the wrong keys, and that
+ * the application byte stream arrives complete and in order.
+ *
+ * test_tls13_key_update_bad_record corrupts records in flight and verifies
+ * the receiver never rolls back to old keys, never advances its key
+ * schedule and never delivers unauthenticated plaintext.
+ *
+ * test_dtls13_key_update_bad_record checks the DTLS 1.3 behavior: the bad
+ * datagram is dropped without touching key/epoch state and the connection
+ * continues to exchange data and key updates afterwards.
+ * ------------------------------------------------------------------------- */
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && defined(WOLFSSL_TLS13)
+
+/* Snapshot of the TLS 1.3 record protection state of one connection: the
+ * application traffic secrets, the derived traffic keys/IVs and the record
+ * sequence numbers in both directions. */
+typedef struct TestKuState {
+    byte   cliSecret[SECRET_LEN];
+    byte   srvSecret[SECRET_LEN];
+    byte   cliKey[MAX_SYM_KEY_SIZE];
+    byte   srvKey[MAX_SYM_KEY_SIZE];
+    byte   cliIV[MAX_WRITE_IV_SZ];
+    byte   srvIV[MAX_WRITE_IV_SZ];
+    word32 seqHi;     /* next send record sequence number */
+    word32 seqLo;
+    word32 peerSeqHi; /* next receive record sequence number */
+    word32 peerSeqLo;
+} TestKuState;
+
+static void test_ku_snapshot(const WOLFSSL* ssl, TestKuState* st)
+{
+    XMEMCPY(st->cliSecret, ssl->clientSecret, sizeof(st->cliSecret));
+    XMEMCPY(st->srvSecret, ssl->serverSecret, sizeof(st->srvSecret));
+    XMEMCPY(st->cliKey, ssl->keys.client_write_key, sizeof(st->cliKey));
+    XMEMCPY(st->srvKey, ssl->keys.server_write_key, sizeof(st->srvKey));
+    XMEMCPY(st->cliIV, ssl->keys.client_write_IV, sizeof(st->cliIV));
+    XMEMCPY(st->srvIV, ssl->keys.server_write_IV, sizeof(st->srvIV));
+    st->seqHi = ssl->keys.sequence_number_hi;
+    st->seqLo = ssl->keys.sequence_number_lo;
+    st->peerSeqHi = ssl->keys.peer_sequence_number_hi;
+    st->peerSeqLo = ssl->keys.peer_sequence_number_lo;
+}
+
+/* 1 when the live state of ssl matches the snapshot exactly. */
+static int test_ku_state_eq(const WOLFSSL* ssl, const TestKuState* st)
+{
+    return XMEMCMP(st->cliSecret, ssl->clientSecret,
+                   sizeof(st->cliSecret)) == 0 &&
+           XMEMCMP(st->srvSecret, ssl->serverSecret,
+                   sizeof(st->srvSecret)) == 0 &&
+           XMEMCMP(st->cliKey, ssl->keys.client_write_key,
+                   sizeof(st->cliKey)) == 0 &&
+           XMEMCMP(st->srvKey, ssl->keys.server_write_key,
+                   sizeof(st->srvKey)) == 0 &&
+           XMEMCMP(st->cliIV, ssl->keys.client_write_IV,
+                   sizeof(st->cliIV)) == 0 &&
+           XMEMCMP(st->srvIV, ssl->keys.server_write_IV,
+                   sizeof(st->srvIV)) == 0 &&
+           st->seqHi == ssl->keys.sequence_number_hi &&
+           st->seqLo == ssl->keys.sequence_number_lo &&
+           st->peerSeqHi == ssl->keys.peer_sequence_number_hi &&
+           st->peerSeqLo == ssl->keys.peer_sequence_number_lo;
+}
+
+/* 1 when the key-schedule part of the snapshot (secrets, traffic keys and
+ * IVs, but not the sequence numbers) matches the live state. */
+static int test_ku_keys_eq(const WOLFSSL* ssl, const TestKuState* st)
+{
+    return XMEMCMP(st->cliSecret, ssl->clientSecret,
+                   sizeof(st->cliSecret)) == 0 &&
+           XMEMCMP(st->srvSecret, ssl->serverSecret,
+                   sizeof(st->srvSecret)) == 0 &&
+           XMEMCMP(st->cliKey, ssl->keys.client_write_key,
+                   sizeof(st->cliKey)) == 0 &&
+           XMEMCMP(st->srvKey, ssl->keys.server_write_key,
+                   sizeof(st->srvKey)) == 0 &&
+           XMEMCMP(st->cliIV, ssl->keys.client_write_IV,
+                   sizeof(st->cliIV)) == 0 &&
+           XMEMCMP(st->srvIV, ssl->keys.server_write_IV,
+                   sizeof(st->srvIV)) == 0;
+}
+
+#ifdef WOLFSSL_DTLS13
+/* 1 when the traffic secrets and the four record sequence counters of the
+ * snapshot match the live state. Used by the DTLS 1.3 test, where the
+ * arrival of a record from a newer epoch legitimately activates the
+ * already-derived keys of that epoch into ssl->keys, so the derived
+ * key/IV slots are not comparable there. */
+static int test_ku_secret_seq_eq(const WOLFSSL* ssl, const TestKuState* st)
+{
+    return XMEMCMP(st->cliSecret, ssl->clientSecret,
+                   sizeof(st->cliSecret)) == 0 &&
+           XMEMCMP(st->srvSecret, ssl->serverSecret,
+                   sizeof(st->srvSecret)) == 0 &&
+           st->seqHi == ssl->keys.sequence_number_hi &&
+           st->seqLo == ssl->keys.sequence_number_lo &&
+           st->peerSeqHi == ssl->keys.peer_sequence_number_hi &&
+           st->peerSeqLo == ssl->keys.peer_sequence_number_lo;
+}
+#endif /* WOLFSSL_DTLS13 */
+
+/* 1 when the client-to-server traffic secret/key/IV of the two connection
+ * ends agree: one side encrypts with what the other decrypts with. */
+static int test_ku_cli_keys_match(const WOLFSSL* a, const WOLFSSL* b)
+{
+    return XMEMCMP(a->clientSecret, b->clientSecret,
+                   sizeof(a->clientSecret)) == 0 &&
+           XMEMCMP(a->keys.client_write_key, b->keys.client_write_key,
+                   sizeof(a->keys.client_write_key)) == 0 &&
+           XMEMCMP(a->keys.client_write_IV, b->keys.client_write_IV,
+                   sizeof(a->keys.client_write_IV)) == 0;
+}
+
+/* 1 when the server-to-client traffic secret/key/IV of the two connection
+ * ends agree. */
+static int test_ku_srv_keys_match(const WOLFSSL* a, const WOLFSSL* b)
+{
+    return XMEMCMP(a->serverSecret, b->serverSecret,
+                   sizeof(a->serverSecret)) == 0 &&
+           XMEMCMP(a->keys.server_write_key, b->keys.server_write_key,
+                   sizeof(a->keys.server_write_key)) == 0 &&
+           XMEMCMP(a->keys.server_write_IV, b->keys.server_write_IV,
+                   sizeof(a->keys.server_write_IV)) == 0;
+}
+
+#ifdef WOLFSSL_DTLS13
+/* 1 when the application traffic secrets of the two connection ends
+ * agree. DTLS 1.3 keeps the derived record keys in per-epoch slots, so
+ * the secrets are the comparable key-schedule state there. */
+static int test_ku_secrets_match(const WOLFSSL* a, const WOLFSSL* b)
+{
+    return XMEMCMP(a->clientSecret, b->clientSecret,
+                   sizeof(a->clientSecret)) == 0 &&
+           XMEMCMP(a->serverSecret, b->serverSecret,
+                   sizeof(a->serverSecret)) == 0;
+}
+#endif /* WOLFSSL_DTLS13 */
+
+/* Pump post-handshake records (KeyUpdate, NewSessionTicket, ACKs, ...)
+ * between the two ends until neither side has anything left in flight.
+ * Reads are what drive post-handshake message processing and any sending
+ * that processing schedules. Returns 0 when both transport buffers are
+ * drained, negative on error. Must only be called when no application
+ * data is in flight. */
+static int test_ku_pump(struct test_memio_ctx* tctx, WOLFSSL* ssl_c,
+        WOLFSSL* ssl_s)
+{
+    byte drain[512];
+    int i;
+
+    for (i = 0; i < 20; i++) {
+        int ret = wolfSSL_read(ssl_s, drain, (int)sizeof(drain));
+        if (ret < 0 &&
+                wolfSSL_get_error(ssl_s, ret) != WOLFSSL_ERROR_WANT_READ) {
+            return -1;
+        }
+        ret = wolfSSL_read(ssl_c, drain, (int)sizeof(drain));
+        if (ret < 0 &&
+                wolfSSL_get_error(ssl_c, ret) != WOLFSSL_ERROR_WANT_READ) {
+            return -2;
+        }
+        if (tctx->c_len == 0 && tctx->s_len == 0)
+            return 0;
+    }
+    return -3;
+}
+
+#define TEST_KU_MSG_SZ 37 /* not a multiple of any short I/O cap */
+
+/* Fill buf with a pattern unique to tag so every application message in a
+ * direction is distinguishable: loss, reordering and duplication of
+ * messages all show up as a pattern mismatch. */
+static void test_ku_fill(byte* buf, int sz, word32 tag)
+{
+    int i;
+    for (i = 0; i < sz; i++)
+        buf[i] = (byte)(tag * 13 + (word32)i);
+}
+
+/* 1 when buf holds exactly the pattern of tag. */
+static int test_ku_check(const byte* buf, int sz, word32 tag)
+{
+    int i;
+    for (i = 0; i < sz; i++) {
+        if (buf[i] != (byte)(tag * 13 + (word32)i))
+            return 0;
+    }
+    return 1;
+}
+
+/* Send one patterned message from ssl_w and receive it on ssl_r, checking
+ * length and content. */
+#define KU_SEND_RECV(ssl_w, ssl_r, tag) do {                              \
+    test_ku_fill(kuTx, TEST_KU_MSG_SZ, (word32)(tag));                    \
+    XMEMSET(kuRx, 0, sizeof(kuRx));                                       \
+    ExpectIntEQ(wolfSSL_write((ssl_w), kuTx, TEST_KU_MSG_SZ),             \
+            TEST_KU_MSG_SZ);                                              \
+    ExpectIntEQ(wolfSSL_read((ssl_r), kuRx, (int)sizeof(kuRx)),           \
+            TEST_KU_MSG_SZ);                                              \
+    ExpectTrue(test_ku_check(kuRx, TEST_KU_MSG_SZ, (word32)(tag)));       \
+} while (0)
+
+/* All four record sequence counters of both ends are zero: they restart
+ * at zero whenever the corresponding traffic keys change (RFC 8446 5.3). */
+#define KU_EXPECT_SEQ_ZERO() do {                                         \
+    ExpectIntEQ(ssl_c->keys.sequence_number_hi, 0);                       \
+    ExpectIntEQ(ssl_c->keys.sequence_number_lo, 0);                       \
+    ExpectIntEQ(ssl_c->keys.peer_sequence_number_hi, 0);                  \
+    ExpectIntEQ(ssl_c->keys.peer_sequence_number_lo, 0);                  \
+    ExpectIntEQ(ssl_s->keys.sequence_number_hi, 0);                       \
+    ExpectIntEQ(ssl_s->keys.sequence_number_lo, 0);                       \
+    ExpectIntEQ(ssl_s->keys.peer_sequence_number_hi, 0);                  \
+    ExpectIntEQ(ssl_s->keys.peer_sequence_number_lo, 0);                  \
+} while (0)
+
+/* The send counter of each end must equal the receive counter of its peer
+ * and both must equal the number of records sent since the last key
+ * change in that direction. */
+#define KU_EXPECT_SEQ(c2s, s2c) do {                                      \
+    ExpectIntEQ(ssl_c->keys.sequence_number_lo, (c2s));                   \
+    ExpectIntEQ(ssl_s->keys.peer_sequence_number_lo, (c2s));              \
+    ExpectIntEQ(ssl_s->keys.sequence_number_lo, (s2c));                   \
+    ExpectIntEQ(ssl_c->keys.peer_sequence_number_lo, (s2c));              \
+} while (0)
+
+#endif /* HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES && WOLFSSL_TLS13 */
+
+static int test_tls13_key_update_short_io(void)
+{
+    EXPECT_DECLS;
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && defined(WOLFSSL_TLS13)
+    struct test_memio_ctx test_ctx;
+    WOLFSSL_CTX *ctx_c = NULL, *ctx_s = NULL;
+    WOLFSSL *ssl_c = NULL, *ssl_s = NULL;
+    TestKuState snapC, snapS, prevC;
+    byte kuTx[TEST_KU_MSG_SZ];
+    byte kuRx[TEST_KU_MSG_SZ + 16];
+    word32 c2sTag = 0, s2cTag = 0;
+    int required;
+    int i;
+
+    printf("Testing TLS 1.3 KeyUpdate with short I/O... ");
+
+    XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+    ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c, &ssl_s,
+            wolfTLSv1_3_client_method, wolfTLSv1_3_server_method), 0);
+
+    /* Split every record into many short reads and writes, handshake
+     * included. */
+    test_ctx.c_max_read = 5;
+    test_ctx.s_max_read = 7;
+    test_ctx.c_max_write = 11;
+    test_ctx.s_max_write = 13;
+
+    ExpectIntEQ(test_memio_do_handshake(ssl_c, ssl_s, 200, NULL), 0);
+
+    /* Baseline: the stream works with short I/O before any update. Also
+     * flushes the post-handshake NewSessionTicket. */
+    for (i = 0; i < 3 && !EXPECT_FAIL(); i++) {
+        KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+        KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    }
+    ExpectIntEQ(test_ctx.c_len, 0);
+    ExpectIntEQ(test_ctx.s_len, 0);
+
+    test_ku_snapshot(ssl_c, &snapC);
+    test_ku_snapshot(ssl_s, &snapS);
+
+    /* --- Phase 1: client-initiated KeyUpdate requesting a response. --- */
+    ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_key_update_response(ssl_c, &required), 0);
+    ExpectIntEQ(required, 1);
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+    ExpectIntEQ(wolfSSL_key_update_response(ssl_c, &required), 0);
+    ExpectIntEQ(required, 0);
+    /* Sequence numbers restarted on both directions of both ends. */
+    KU_EXPECT_SEQ_ZERO();
+    /* Both directions re-keyed (client by its own update, server by the
+     * requested response) and the two ends agree with each other. */
+    ExpectFalse(test_ku_state_eq(ssl_c, &snapC));
+    ExpectFalse(test_ku_state_eq(ssl_s, &snapS));
+    ExpectTrue(test_ku_cli_keys_match(ssl_c, ssl_s));
+    ExpectTrue(test_ku_srv_keys_match(ssl_c, ssl_s));
+
+    /* Data flows under the new keys, counters advance one per record. */
+    for (i = 0; i < 5 && !EXPECT_FAIL(); i++) {
+        KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+        KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    }
+    KU_EXPECT_SEQ(5, 5);
+
+    /* --- Phase 2: server-initiated KeyUpdate requesting a response. --- */
+    test_ku_snapshot(ssl_c, &snapC);
+    test_ku_snapshot(ssl_s, &snapS);
+    ExpectIntEQ(wolfSSL_update_keys(ssl_s), WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_key_update_response(ssl_s, &required), 0);
+    ExpectIntEQ(required, 1);
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+    ExpectIntEQ(wolfSSL_key_update_response(ssl_s, &required), 0);
+    ExpectIntEQ(required, 0);
+    KU_EXPECT_SEQ_ZERO();
+    ExpectFalse(test_ku_state_eq(ssl_c, &snapC));
+    ExpectFalse(test_ku_state_eq(ssl_s, &snapS));
+    ExpectTrue(test_ku_cli_keys_match(ssl_c, ssl_s));
+    ExpectTrue(test_ku_srv_keys_match(ssl_c, ssl_s));
+    for (i = 0; i < 3 && !EXPECT_FAIL(); i++) {
+        KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+        KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    }
+    KU_EXPECT_SEQ(3, 3);
+
+    /* --- Phase 3: repeated updates, each must re-key again. --- */
+    for (i = 0; i < 3 && !EXPECT_FAIL(); i++) {
+        test_ku_snapshot(ssl_c, &prevC);
+        ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+        ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+        KU_EXPECT_SEQ_ZERO();
+        ExpectFalse(test_ku_state_eq(ssl_c, &prevC));
+        ExpectTrue(test_ku_cli_keys_match(ssl_c, ssl_s));
+        ExpectTrue(test_ku_srv_keys_match(ssl_c, ssl_s));
+        KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+        KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    }
+    KU_EXPECT_SEQ(1, 1);
+
+    /* --- Phase 4: back-to-back updates with no read in between. The
+     * second KeyUpdate goes out as update_not_requested while the
+     * response to the first is still outstanding; the send keys rotate
+     * twice before the peer catches up. --- */
+    test_ku_snapshot(ssl_c, &snapC);
+    test_ku_snapshot(ssl_s, &snapS);
+    ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+    KU_EXPECT_SEQ_ZERO();
+    ExpectFalse(test_ku_state_eq(ssl_c, &snapC));
+    ExpectFalse(test_ku_state_eq(ssl_s, &snapS));
+    ExpectTrue(test_ku_cli_keys_match(ssl_c, ssl_s));
+    ExpectTrue(test_ku_srv_keys_match(ssl_c, ssl_s));
+    for (i = 0; i < 2 && !EXPECT_FAIL(); i++) {
+        KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+        KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    }
+    KU_EXPECT_SEQ(2, 2);
+
+    /* --- Phase 5: short write leaves the record pending; the retry
+     * sends exactly the pending bytes, nothing is duplicated or lost. --- */
+    test_memio_simulate_want_write(&test_ctx, 1, 1);
+    test_ku_fill(kuTx, TEST_KU_MSG_SZ, c2sTag);
+    ExpectIntEQ(wolfSSL_write(ssl_c, kuTx, TEST_KU_MSG_SZ),
+            WOLFSSL_FATAL_ERROR);
+    ExpectIntEQ(wolfSSL_get_error(ssl_c, WOLFSSL_FATAL_ERROR),
+            WOLFSSL_ERROR_WANT_WRITE);
+    /* The unsent record waits in the output buffer ... */
+    ExpectIntGT((int)ssl_c->buffers.outputBuffer.length, 0);
+    /* ... and nothing reached the transport yet. */
+    ExpectIntEQ(test_ctx.s_len, 0);
+    test_memio_simulate_want_write(&test_ctx, 1, 0);
+    ExpectIntEQ(wolfSSL_write(ssl_c, kuTx, TEST_KU_MSG_SZ), TEST_KU_MSG_SZ);
+    ExpectIntEQ((int)ssl_c->buffers.outputBuffer.length, 0);
+    XMEMSET(kuRx, 0, sizeof(kuRx));
+    ExpectIntEQ(wolfSSL_read(ssl_s, kuRx, (int)sizeof(kuRx)),
+            TEST_KU_MSG_SZ);
+    ExpectTrue(test_ku_check(kuRx, TEST_KU_MSG_SZ, c2sTag));
+    c2sTag++;
+    KU_EXPECT_SEQ(3, 2);
+
+    /* Partial read: the rest of the record stays pending. */
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    test_ku_fill(kuTx, TEST_KU_MSG_SZ, c2sTag);
+    ExpectIntEQ(wolfSSL_write(ssl_c, kuTx, TEST_KU_MSG_SZ), TEST_KU_MSG_SZ);
+    XMEMSET(kuRx, 0, sizeof(kuRx));
+    ExpectIntEQ(wolfSSL_read(ssl_s, kuRx, 10), 10);
+    ExpectIntEQ(wolfSSL_pending(ssl_s), TEST_KU_MSG_SZ - 10);
+    ExpectIntEQ(wolfSSL_read(ssl_s, kuRx + 10, (int)sizeof(kuRx) - 10),
+            TEST_KU_MSG_SZ - 10);
+    ExpectTrue(test_ku_check(kuRx, TEST_KU_MSG_SZ, c2sTag));
+    c2sTag++;
+    KU_EXPECT_SEQ(4, 3);
+
+    /* --- Phase 6: KeyUpdate itself blocked on a short write. The
+     * pending KeyUpdate (encrypted under the old keys) must go out before
+     * the application data written under the new keys. --- */
+    test_ku_snapshot(ssl_c, &snapC);
+    test_memio_simulate_want_write(&test_ctx, 1, 1);
+    ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_ERROR_WANT_WRITE);
+    /* Send keys already rotated, the KeyUpdate record is still pending. */
+    ExpectIntGT((int)ssl_c->buffers.outputBuffer.length, 0);
+    ExpectIntEQ(test_ctx.s_len, 0);
+    ExpectFalse(test_ku_state_eq(ssl_c, &snapC));
+    test_memio_simulate_want_write(&test_ctx, 1, 0);
+    test_ku_fill(kuTx, TEST_KU_MSG_SZ, c2sTag);
+    ExpectIntEQ(wolfSSL_write(ssl_c, kuTx, TEST_KU_MSG_SZ), TEST_KU_MSG_SZ);
+    ExpectIntEQ((int)ssl_c->buffers.outputBuffer.length, 0);
+    /* The server processes the KeyUpdate and then the data record. */
+    XMEMSET(kuRx, 0, sizeof(kuRx));
+    ExpectIntEQ(wolfSSL_read(ssl_s, kuRx, (int)sizeof(kuRx)),
+            TEST_KU_MSG_SZ);
+    ExpectTrue(test_ku_check(kuRx, TEST_KU_MSG_SZ, c2sTag));
+    c2sTag++;
+    /* Finish the requested update round and confirm consistency. */
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+    ExpectTrue(test_ku_cli_keys_match(ssl_c, ssl_s));
+    ExpectTrue(test_ku_srv_keys_match(ssl_c, ssl_s));
+    /* Client sent one record (the data) since its key change. */
+    ExpectIntEQ(ssl_c->keys.sequence_number_lo, 1);
+    ExpectIntEQ(ssl_s->keys.peer_sequence_number_lo, 1);
+    ExpectIntEQ(ssl_s->keys.sequence_number_lo, 0);
+    ExpectIntEQ(ssl_c->keys.peer_sequence_number_lo, 0);
+
+    /* The stream is still intact and ordered after everything above. */
+    for (i = 0; i < 3 && !EXPECT_FAIL(); i++) {
+        KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+        KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    }
+    KU_EXPECT_SEQ(4, 3);
+
+    if (EXPECT_SUCCESS())
+        printf("ok\n");
+    else
+        printf("failed\n");
+
+    wolfSSL_free(ssl_c);
+    wolfSSL_free(ssl_s);
+    wolfSSL_CTX_free(ctx_c);
+    wolfSSL_CTX_free(ctx_s);
+#endif
+    return EXPECT_RESULT();
+}
+
+static int test_tls13_key_update_bad_record(void)
+{
+    EXPECT_DECLS;
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && defined(WOLFSSL_TLS13)
+    int scenario;
+
+    /* Scenario 0: corrupted application data record after a completed
+     * key update. Scenario 1: corrupted KeyUpdate record. */
+    for (scenario = 0; scenario < 2 && !EXPECT_FAIL(); scenario++) {
+        struct test_memio_ctx test_ctx;
+        WOLFSSL_CTX *ctx_c = NULL, *ctx_s = NULL;
+        WOLFSSL *ssl_c = NULL, *ssl_s = NULL;
+        TestKuState preC, postC, postS;
+        byte kuTx[TEST_KU_MSG_SZ];
+        byte kuRx[TEST_KU_MSG_SZ + 16];
+        byte* inBuf;
+        int err, i;
+
+        printf("Testing TLS 1.3 KeyUpdate bad record (%s)... ",
+                scenario == 0 ? "app data" : "KeyUpdate");
+
+        XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+        ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c,
+                &ssl_s, wolfTLSv1_3_client_method,
+                wolfTLSv1_3_server_method), 0);
+        /* Short I/O here too: the corrupted record is reassembled from
+         * many short reads. */
+        test_ctx.c_max_read = 6;
+        test_ctx.s_max_read = 6;
+        test_ctx.c_max_write = 9;
+        test_ctx.s_max_write = 9;
+        ExpectIntEQ(test_memio_do_handshake(ssl_c, ssl_s, 200, NULL), 0);
+
+        /* Flush the NewSessionTicket. */
+        KU_SEND_RECV(ssl_c, ssl_s, 0);
+        KU_SEND_RECV(ssl_s, ssl_c, 1);
+
+        /* Complete a client-initiated key update round. */
+        ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+        ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+        ExpectTrue(test_ku_cli_keys_match(ssl_c, ssl_s));
+        ExpectTrue(test_ku_srv_keys_match(ssl_c, ssl_s));
+
+        if (scenario == 0) {
+            /* Remember the pre-update generation to prove later there is
+             * no rollback to it. */
+            test_ku_snapshot(ssl_c, &preC);
+            /* One more update so the pre-update keys are history. */
+            ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+            ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+            ExpectFalse(test_ku_state_eq(ssl_c, &preC));
+        }
+        else {
+            XMEMSET(&preC, 0, sizeof(preC));
+        }
+
+        if (scenario == 0) {
+            /* Server sends application data; corrupt the AEAD tag of the
+             * record while it is in flight towards the client. */
+            test_ku_fill(kuTx, TEST_KU_MSG_SZ, 2);
+            ExpectIntEQ(wolfSSL_write(ssl_s, kuTx, TEST_KU_MSG_SZ),
+                    TEST_KU_MSG_SZ);
+            ExpectIntGT(test_ctx.c_len, 0);
+            inBuf = test_ctx.c_buff;
+            i = test_ctx.c_len;
+        }
+        else {
+            /* Client sends a KeyUpdate; corrupt it in flight towards the
+             * server. */
+            ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+            ExpectIntGT(test_ctx.s_len, 0);
+            inBuf = test_ctx.s_buff;
+            i = test_ctx.s_len;
+        }
+
+        /* Snapshot after all legitimate sends (the client's send keys are
+         * already rotated in scenario 1), before the corrupted record is
+         * read. */
+        test_ku_snapshot(ssl_c, &postC);
+        test_ku_snapshot(ssl_s, &postS);
+
+        inBuf[i - 1] ^= 0x01;
+
+        /* The read must fail: no plaintext from a bad record. */
+        XMEMSET(kuRx, 0xA5, sizeof(kuRx));
+        ExpectIntEQ(wolfSSL_read(scenario == 0 ? ssl_c : ssl_s, kuRx,
+                (int)sizeof(kuRx)), WOLFSSL_FATAL_ERROR);
+        err = wolfSSL_get_error(scenario == 0 ? ssl_c : ssl_s,
+                WOLFSSL_FATAL_ERROR);
+        ExpectTrue(err != WOLFSSL_ERROR_WANT_READ);
+        ExpectTrue(err != WOLFSSL_ERROR_WANT_WRITE);
+        for (i = 0; i < (int)sizeof(kuRx); i++)
+            ExpectIntEQ(kuRx[i], 0xA5);
+
+        /* The bad record changed no key-schedule state: same secrets,
+         * same traffic keys and IVs - no rollback to the old key
+         * generation, no advance to a new one. */
+        ExpectTrue(test_ku_keys_eq(ssl_c, &postC));
+        ExpectTrue(test_ku_keys_eq(ssl_s, &postS));
+        /* The failed record consumed its own receive sequence number on
+         * the decryption attempt and the receiver's fatal alert consumed
+         * one send sequence number. Every other counter is untouched. */
+        {
+            WOLFSSL* rd = scenario == 0 ? ssl_c : ssl_s;
+            TestKuState* rdSnap = scenario == 0 ? &postC : &postS;
+            WOLFSSL* wr = scenario == 0 ? ssl_s : ssl_c;
+            TestKuState* wrSnap = scenario == 0 ? &postS : &postC;
+            ExpectIntEQ((int)rd->keys.peer_sequence_number_lo,
+                    (int)rdSnap->peerSeqLo + 1);
+            ExpectIntEQ((int)rd->keys.peer_sequence_number_hi,
+                    (int)rdSnap->peerSeqHi);
+            ExpectIntEQ((int)rd->keys.sequence_number_lo,
+                    (int)rdSnap->seqLo + 1);
+            ExpectIntEQ((int)rd->keys.sequence_number_hi,
+                    (int)rdSnap->seqHi);
+            ExpectIntEQ((int)wr->keys.peer_sequence_number_lo,
+                    (int)wrSnap->peerSeqLo);
+            ExpectIntEQ((int)wr->keys.peer_sequence_number_hi,
+                    (int)wrSnap->peerSeqHi);
+            ExpectIntEQ((int)wr->keys.sequence_number_lo,
+                    (int)wrSnap->seqLo);
+            ExpectIntEQ((int)wr->keys.sequence_number_hi,
+                    (int)wrSnap->seqHi);
+        }
+        if (scenario == 0) {
+            /* Still on the post-update generation, not the old keys. */
+            ExpectFalse(test_ku_state_eq(ssl_c, &preC));
+        }
+
+        /* The error is latched: a retry fails again instead of delivering
+         * data, and the key schedule is still where it was. */
+        XMEMSET(kuRx, 0xA5, sizeof(kuRx));
+        ExpectIntEQ(wolfSSL_read(scenario == 0 ? ssl_c : ssl_s, kuRx,
+                (int)sizeof(kuRx)), WOLFSSL_FATAL_ERROR);
+        ExpectIntEQ(wolfSSL_get_error(scenario == 0 ? ssl_c : ssl_s,
+                WOLFSSL_FATAL_ERROR), err);
+        for (i = 0; i < (int)sizeof(kuRx); i++)
+            ExpectIntEQ(kuRx[i], 0xA5);
+        ExpectTrue(test_ku_keys_eq(ssl_c, &postC));
+        ExpectTrue(test_ku_keys_eq(ssl_s, &postS));
+
+        if (EXPECT_SUCCESS())
+            printf("ok\n");
+        else
+            printf("failed\n");
+
+        wolfSSL_free(ssl_c);
+        wolfSSL_free(ssl_s);
+        wolfSSL_CTX_free(ctx_c);
+        wolfSSL_CTX_free(ctx_s);
+    }
+#endif
+    return EXPECT_RESULT();
+}
+
+static int test_dtls13_key_update_bad_record(void)
+{
+    EXPECT_DECLS;
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && defined(WOLFSSL_DTLS13)
+    struct test_memio_ctx test_ctx;
+    WOLFSSL_CTX *ctx_c = NULL, *ctx_s = NULL;
+    WOLFSSL *ssl_c = NULL, *ssl_s = NULL;
+    TestKuState snapC, snapS;
+    w64wrapper epochC, peerEpochC;
+    byte kuTx[TEST_KU_MSG_SZ];
+    byte kuRx[TEST_KU_MSG_SZ + 16];
+    word32 c2sTag = 0, s2cTag = 0;
+    int required;
+    int i;
+
+    printf("Testing DTLS 1.3 KeyUpdate bad record drop... ");
+
+    XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+    ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c, &ssl_s,
+            wolfDTLSv1_3_client_method, wolfDTLSv1_3_server_method), 0);
+    ExpectIntEQ(test_memio_do_handshake(ssl_c, ssl_s, 10, NULL), 0);
+
+    /* Baseline exchange; also flushes NewSessionTicket and its ACK. */
+    KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+
+    /* Client-initiated key update round. */
+    ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+    KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+    ExpectIntEQ(wolfSSL_key_update_response(ssl_c, &required), 0);
+    ExpectIntEQ(required, 0);
+    ExpectTrue(test_ku_secrets_match(ssl_c, ssl_s));
+    /* Both ends agree on the send/recv epochs. */
+    ExpectIntEQ(XMEMCMP(&ssl_c->dtls13Epoch, &ssl_s->dtls13PeerEpoch,
+            sizeof(w64wrapper)), 0);
+    ExpectIntEQ(XMEMCMP(&ssl_c->dtls13PeerEpoch, &ssl_s->dtls13Epoch,
+            sizeof(w64wrapper)), 0);
+
+    test_ku_snapshot(ssl_c, &snapC);
+    test_ku_snapshot(ssl_s, &snapS);
+    XMEMCPY(&epochC, &ssl_c->dtls13Epoch, sizeof(w64wrapper));
+    XMEMCPY(&peerEpochC, &ssl_c->dtls13PeerEpoch, sizeof(w64wrapper));
+
+    /* Server sends application data; corrupt the AEAD tag in flight. */
+    test_ku_fill(kuTx, TEST_KU_MSG_SZ, 0xFF00);
+    ExpectIntEQ(wolfSSL_write(ssl_s, kuTx, TEST_KU_MSG_SZ), TEST_KU_MSG_SZ);
+    ExpectIntGT(test_ctx.c_len, 0);
+    test_ctx.c_buff[test_ctx.c_len - 1] ^= 0x01;
+
+    /* The forged datagram is dropped: read reports no data, delivers no
+     * plaintext and leaves the connection usable. */
+    XMEMSET(kuRx, 0xA5, sizeof(kuRx));
+    ExpectIntEQ(wolfSSL_read(ssl_c, kuRx, (int)sizeof(kuRx)),
+            WOLFSSL_FATAL_ERROR);
+    ExpectIntEQ(wolfSSL_get_error(ssl_c, WOLFSSL_FATAL_ERROR),
+            WOLFSSL_ERROR_WANT_READ);
+    for (i = 0; i < (int)sizeof(kuRx); i++)
+        ExpectIntEQ(kuRx[i], 0xA5);
+    /* Traffic secrets, sequence numbers and epochs untouched. (The
+     * derived key slots may hold the newly activated epoch's keys, see
+     * test_ku_secret_seq_eq.) */
+    ExpectTrue(test_ku_secret_seq_eq(ssl_c, &snapC));
+    ExpectTrue(test_ku_secret_seq_eq(ssl_s, &snapS));
+    ExpectIntEQ(XMEMCMP(&ssl_c->dtls13Epoch, &epochC, sizeof(w64wrapper)),
+            0);
+    ExpectIntEQ(XMEMCMP(&ssl_c->dtls13PeerEpoch, &peerEpochC,
+            sizeof(w64wrapper)), 0);
+
+    /* The connection continues: valid records flow in both directions. */
+    KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+
+    /* Same in the other direction: a corrupted client datagram is
+     * dropped by the server without state change. */
+    test_ku_snapshot(ssl_c, &snapC);
+    test_ku_snapshot(ssl_s, &snapS);
+    test_ku_fill(kuTx, TEST_KU_MSG_SZ, 0xFF01);
+    ExpectIntEQ(wolfSSL_write(ssl_c, kuTx, TEST_KU_MSG_SZ), TEST_KU_MSG_SZ);
+    ExpectIntGT(test_ctx.s_len, 0);
+    test_ctx.s_buff[test_ctx.s_len - 1] ^= 0x01;
+    XMEMSET(kuRx, 0xA5, sizeof(kuRx));
+    ExpectIntEQ(wolfSSL_read(ssl_s, kuRx, (int)sizeof(kuRx)),
+            WOLFSSL_FATAL_ERROR);
+    ExpectIntEQ(wolfSSL_get_error(ssl_s, WOLFSSL_FATAL_ERROR),
+            WOLFSSL_ERROR_WANT_READ);
+    for (i = 0; i < (int)sizeof(kuRx); i++)
+        ExpectIntEQ(kuRx[i], 0xA5);
+    ExpectTrue(test_ku_secret_seq_eq(ssl_c, &snapC));
+    ExpectTrue(test_ku_secret_seq_eq(ssl_s, &snapS));
+    KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+
+    /* The key schedule is unharmed: another update round works and both
+     * ends land on the same new keys and epochs. */
+    test_ku_snapshot(ssl_c, &snapC);
+    ExpectIntEQ(wolfSSL_update_keys(ssl_c), WOLFSSL_SUCCESS);
+    KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+    ExpectIntEQ(test_ku_pump(&test_ctx, ssl_c, ssl_s), 0);
+    ExpectIntEQ(wolfSSL_key_update_response(ssl_c, &required), 0);
+    ExpectIntEQ(required, 0);
+    ExpectFalse(test_ku_state_eq(ssl_c, &snapC));
+    ExpectTrue(test_ku_secrets_match(ssl_c, ssl_s));
+    ExpectIntEQ(XMEMCMP(&ssl_c->dtls13Epoch, &ssl_s->dtls13PeerEpoch,
+            sizeof(w64wrapper)), 0);
+    ExpectIntEQ(XMEMCMP(&ssl_c->dtls13PeerEpoch, &ssl_s->dtls13Epoch,
+            sizeof(w64wrapper)), 0);
+    KU_SEND_RECV(ssl_c, ssl_s, c2sTag); c2sTag++;
+    KU_SEND_RECV(ssl_s, ssl_c, s2cTag); s2cTag++;
+
+    if (EXPECT_SUCCESS())
+        printf("ok\n");
+    else
+        printf("failed\n");
+
+    wolfSSL_free(ssl_c);
+    wolfSSL_free(ssl_s);
+    wolfSSL_CTX_free(ctx_c);
+    wolfSSL_CTX_free(ctx_s);
+#endif
+    return EXPECT_RESULT();
+}
+
 #if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && defined(HAVE_WRITE_DUP) && \
     defined(HAVE_CHACHA) && defined(HAVE_POLY1305) && !defined(NO_SHA256) &&    \
     (defined(HAVE_ECC) || defined(HAVE_CURVE25519) ||                           \
@@ -48891,6 +49610,9 @@ TEST_CASE testCases[] = {
     TEST_DECL(test_write_dup_want_write),
     TEST_DECL(test_write_dup_want_write_simul),
     TEST_DECL(test_write_dup_negotiate_pha),
+    TEST_DECL(test_tls13_key_update_short_io),
+    TEST_DECL(test_tls13_key_update_bad_record),
+    TEST_DECL(test_dtls13_key_update_bad_record),
     TEST_DECL(test_write_dup_oom),
     TEST_DECL(test_wc_SrpComputeKey_oom),
     TEST_DECL(test_read_write_hs),
