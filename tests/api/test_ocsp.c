@@ -7320,3 +7320,346 @@ int test_ocsp_check_validity(void)
     return TEST_SKIPPED;
 }
 #endif
+
+/* ------------------------------------------------------------------ */
+/* Offline OCSP response/certificate identity binding integration     */
+/* tests. Everything here runs against local, generated response       */
+/* blobs: no network access and no public OCSP responder are involved. */
+/* ------------------------------------------------------------------ */
+#if defined(HAVE_OCSP) && !defined(NO_SHA) && !defined(NO_RSA) && \
+    !defined(NO_FILESYSTEM) && !defined(NO_CERTS)
+
+/* One canned answer for an offline OCSP lookup. The CM is configured with an
+ * override URL, so the URL on the certificate is ignored and the IO callback
+ * always hands back this blob instead of touching a socket. */
+struct test_ocsp_offline_answer {
+    const unsigned char* resp;
+    int                  respSz;
+    int                  calls;
+};
+
+static int test_ocsp_offline_io_cb(void* ctx, const char* url, int urlSz,
+    unsigned char* req, int reqSz, unsigned char** respBuf)
+{
+    struct test_ocsp_offline_answer* ans =
+        (struct test_ocsp_offline_answer*)ctx;
+    (void)url;
+    (void)urlSz;
+    (void)req;
+    (void)reqSz;
+
+    if (ans == NULL || ans->resp == NULL) {
+        /* Simulate a responder that never answers. Used to prove cached
+         * statuses are served without a second lookup. */
+        return WOLFSSL_FATAL_ERROR;
+    }
+    ans->calls++;
+    *respBuf = (unsigned char*)ans->resp;
+    return ans->respSz;
+}
+
+/* Build a cert manager that trusts root-ca, has OCSP enabled in offline mode
+ * (override URL + IO callback), and performs every check through local blobs.
+ * The delegated OCSP responder cert is also trusted so that a response whose
+ * embedded responder cert is itself well-formed gets as far as the signature
+ * and CertID-binding checks, where the individual defect categories produce
+ * distinct, explainable error codes. */
+static int test_ocsp_offline_cm(WOLFSSL_CERT_MANAGER** cmOut,
+    struct test_ocsp_offline_answer* ans)
+{
+    EXPECT_DECLS;
+    WOLFSSL_CERT_MANAGER* cm = NULL;
+
+    ExpectNotNull(cm = wolfSSL_CertManagerNew());
+    ExpectIntEQ(wolfSSL_CertManagerEnableOCSP(cm,
+                    WOLFSSL_OCSP_URL_OVERRIDE | WOLFSSL_OCSP_NO_NONCE),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_CertManagerSetOCSPOverrideURL(cm,
+                    "http://offline-ocsp.invalid"),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_CertManagerSetOCSP_Cb(cm, test_ocsp_offline_io_cb,
+                    NULL, ans),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_CertManagerLoadCABuffer(cm, root_ca_cert_pem,
+                    (word32)sizeof(root_ca_cert_pem), WOLFSSL_FILETYPE_ASN1),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_CertManagerLoadCABuffer(cm, ocsp_responder_cert_pem,
+                    (word32)sizeof(ocsp_responder_cert_pem),
+                    WOLFSSL_FILETYPE_ASN1),
+        WOLFSSL_SUCCESS);
+    *cmOut = cm;
+    return EXPECT_RESULT();
+}
+
+/* A response that cannot be bound to the presented certificate must fail
+ * closed with OCSP_LOOKUP_FAIL, and the OCSP object must retain the specific
+ * decode/verification reason so the rejection is explainable rather than a
+ * generic failure. Each case keeps a genuinely valid signature from the
+ * authorized responder; the identity fields are what is wrong.
+ *
+ * Two verification surfaces are exercised:
+ *   - the CertManager offline lookup path (wolfSSL_CertManagerCheckOCSP),
+ *     which is what a verifier uses when the response arrives as a staple or
+ *     through an OCSP IO callback, and
+ *   - the direct OCSP_basic_verify path (OpenSSL-compatible API), where the
+ *     responder authorization check reports the CertID mismatch itself.
+ */
+#if defined(OPENSSL_ALL) || defined(OPENSSL_EXTRA)
+static int test_ocsp_offline_basic_verify(const unsigned char* der, int derSz)
+{
+    EXPECT_DECLS;
+    WOLFSSL_X509_STORE* store = NULL;
+    WOLF_STACK_OF(WOLFSSL_X509)* certs = NULL;
+    const unsigned char* ptr = NULL;
+    OcspResponse* response = NULL;
+
+    ExpectIntEQ(test_ocsp_create_x509store(&store, root_ca_cert_pem,
+                    sizeof(root_ca_cert_pem)),
+        TEST_SUCCESS);
+    ExpectIntEQ(test_create_stack_of_x509(&certs, ocsp_responder_cert_pem,
+                    sizeof(ocsp_responder_cert_pem)),
+        TEST_SUCCESS);
+
+    ptr = der;
+    ExpectNotNull(response = wolfSSL_d2i_OCSP_RESPONSE(NULL, &ptr, derSz));
+    /* A misbound response must not verify even though its signature bytes are
+     * cryptographically valid against the embedded responder certificate. */
+    ExpectIntNE(wolfSSL_OCSP_basic_verify(response, certs, store, 0),
+        WOLFSSL_SUCCESS);
+
+    wolfSSL_OCSP_RESPONSE_free(response);
+    wolfSSL_sk_X509_pop_free(certs, wolfSSL_X509_free);
+    wolfSSL_X509_STORE_free(store);
+    return EXPECT_RESULT();
+}
+#endif
+
+int test_ocsp_offline_identity_binding(void)
+{
+    EXPECT_DECLS;
+
+    struct rejection_case {
+        const char* name;
+        const unsigned char* resp;
+        int          respSz;
+        int          cmReason; /* expected cm->ocsp->error, 0 = mismatch only */
+        /* OCSP_basic_verify enforces responder authorization (CertID hashes
+         * vs the responder cert chain) and the response signature, but it has
+         * no request in hand, so it cannot bind the CertID serial to a
+         * presented certificate - that is CompareOcspReqResp's job in the
+         * CertManager path. Likewise stale responses never reach it because
+         * date enforcement happens while decoding. Set this only for the
+         * cases whose defect basic_verify itself rejects. */
+        int          basicVerifyRejects;
+    } cases[] = {
+        /* CertID serial names a certificate the CA never issued. The
+         * response decodes and its signature verifies, but the request/
+         * response CertID comparison fails, so nothing is cached and the
+         * lookup fails. There is no decode-level reason. */
+        { "wrong serial",
+          resp_certid_serial_mismatch, sizeof(resp_certid_serial_mismatch),
+          0, 0 },
+        /* CertID issuerNameHash does not name the real issuer. With the
+         * responder cert trusted, the response reaches the responder
+         * authorization gate (RFC 6960 4.2.2.2) and fails there. */
+        { "wrong issuer name hash",
+          resp_certid_namehash_mismatch, sizeof(resp_certid_namehash_mismatch),
+          BAD_OCSP_RESPONDER, 1 },
+        /* CertID issuerKeyHash does not name the real issuer key. */
+        { "wrong issuer key hash",
+          resp_certid_keyhash_corrupt, sizeof(resp_certid_keyhash_corrupt),
+          BAD_OCSP_RESPONDER, 1 },
+#if !defined(NO_ASN_TIME_CHECK) && !defined(WOLFSSL_NO_OCSP_DATE_CHECK)
+        /* Validity window already closed. */
+        { "expired nextUpdate",
+          resp_expired_nextupdate, sizeof(resp_expired_nextupdate),
+          ASN_AFTER_DATE_E, 0 },
+        /* thisUpdate claims the response is from the future. */
+        { "future thisUpdate",
+          resp_future_thisupdate, sizeof(resp_future_thisupdate),
+          ASN_BEFORE_DATE_E, 0 },
+#endif
+        /* Signature bytes replayed from an unrelated valid response onto
+         * freshly built TBS data. The responder cert and CertID hashes are
+         * fine, so the failure is the signature confirmation itself. */
+        { "replayed signature",
+          resp_replayed_signature, sizeof(resp_replayed_signature),
+          ASN_OCSP_CONFIRM_E, 1 },
+    };
+    int i;
+
+    for (i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+        WOLFSSL_CERT_MANAGER* cm = NULL;
+        struct test_ocsp_offline_answer ans;
+        int ret;
+
+        XMEMSET(&ans, 0, sizeof(ans));
+        ans.resp = cases[i].resp;
+        ans.respSz = cases[i].respSz;
+
+        ExpectIntEQ(test_ocsp_offline_cm(&cm, &ans), TEST_SUCCESS);
+        if (cm == NULL)
+            return EXPECT_RESULT();
+
+        ret = wolfSSL_CertManagerCheckOCSP(cm, intermediate1_ca_cert_pem,
+                (int)sizeof(intermediate1_ca_cert_pem));
+
+        /* Fail closed: the misbound response is never accepted. */
+        ExpectIntEQ(ret, OCSP_LOOKUP_FAIL);
+        /* The IO callback really supplied the blob, so this is a verification
+         * rejection, not a transport failure. */
+        ExpectIntGT(ans.calls, 0);
+        /* Where decode/verification produced a specific reason, it must be
+         * retained for diagnostics. */
+        if (cases[i].cmReason != 0) {
+            ExpectIntEQ(cm->ocsp->error, cases[i].cmReason);
+        }
+        wolfSSL_CertManagerFree(cm);
+        if (!EXPECT_SUCCESS())
+            return EXPECT_RESULT();
+
+#if defined(OPENSSL_ALL) || defined(OPENSSL_EXTRA)
+        /* Same rejection through the direct verification API for the defect
+         * classes basic_verify is responsible for: responder authorization
+         * and response signature binding. */
+        if (cases[i].basicVerifyRejects) {
+            ExpectIntEQ(test_ocsp_offline_basic_verify(cases[i].resp,
+                            cases[i].respSz),
+                TEST_SUCCESS);
+            if (!EXPECT_SUCCESS())
+                return EXPECT_RESULT();
+        }
+#endif
+    }
+
+    return EXPECT_RESULT();
+}
+
+/* The OCSP cache is keyed by the CertID identity (issuer hashes + serial).
+ * A status validated for one certificate must never be served for a different
+ * certificate, even when both share the same issuer and therefore the same
+ * OcspEntry. Sequence:
+ *   1. cert A (intermediate1, serial 01) is checked against a good response
+ *      and accepted; its status is cached.
+ *   2. cert B (intermediate2, serial 02) is then checked with a callback that
+ *      would fail if invoked. It must not inherit A's cached status: a fresh
+ *      lookup is attempted, fails, and B is refused.
+ *   3. A is checked again with the failing callback: its cached status is
+ *      returned without any IO, proving the first result really was cached and
+ *      the cache lookup is serial-scoped rather than entry-scoped.
+ */
+int test_ocsp_offline_cache_identity(void)
+{
+    EXPECT_DECLS;
+    WOLFSSL_CERT_MANAGER* cm = NULL;
+    struct test_ocsp_offline_answer ans;
+    int ret;
+
+    XMEMSET(&ans, 0, sizeof(ans));
+
+    /* Phase 1: validate cert A against its own good, fresh response. The
+     * response carries nextUpdate 30 days out so the cached entry stays
+     * valid. */
+    ans.resp = resp_intermediate1_good_cached;
+    ans.respSz = (int)sizeof(resp_intermediate1_good_cached);
+    ExpectIntEQ(test_ocsp_offline_cm(&cm, &ans), TEST_SUCCESS);
+    if (cm == NULL)
+        return EXPECT_RESULT();
+
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate1_ca_cert_pem,
+                    (int)sizeof(intermediate1_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(ans.calls, 1);
+
+    /* Phase 2: a different certificate under the same issuer must not match
+     * cert A's cached CertStatus. With no answer available the lookup cannot
+     * produce a status for B, and B is refused rather than borrowing A's
+     * GOOD status. The exact rejection code depends on whether the empty
+     * response short-circuits at the cache (OCSP_INVALID_STATUS) or at
+     * response validation (OCSP_LOOKUP_FAIL); either is fail-closed and both
+     * are non-success, which is the contract under test. */
+    ans.resp = NULL;
+    ans.respSz = 0;
+    ret = wolfSSL_CertManagerCheckOCSP(cm, intermediate2_ca_cert_pem,
+            (int)sizeof(intermediate2_ca_cert_pem));
+    ExpectIntNE(ret, WOLFSSL_SUCCESS);
+    ExpectTrue(ret == OCSP_LOOKUP_FAIL || ret == OCSP_INVALID_STATUS);
+
+    /* Phase 3: cert A's own cached status is still served from the cache, with
+     * no IO callback invocation at all. */
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate1_ca_cert_pem,
+                    (int)sizeof(intermediate1_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(ans.calls, 1);
+
+    /* And for completeness, once a good response naming cert B is supplied, B
+     * succeeds on its own identity and the result is cached separately. */
+    ans.resp = resp_intermediate2_good;
+    ans.respSz = (int)sizeof(resp_intermediate2_good);
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate2_ca_cert_pem,
+                    (int)sizeof(intermediate2_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(ans.calls, 2);
+    /* Both cached identities now resolve without IO. */
+    ans.resp = NULL;
+    ans.respSz = 0;
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate1_ca_cert_pem,
+                    (int)sizeof(intermediate1_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate2_ca_cert_pem,
+                    (int)sizeof(intermediate2_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(ans.calls, 2);
+
+    wolfSSL_CertManagerFree(cm);
+    return EXPECT_RESULT();
+}
+
+/* A well-formed, fresh, correctly-bound offline stapling response must still
+ * be accepted, and the accepted status must be reusable from the cache on the
+ * next check. This is the positive control for the rejection cases above. */
+int test_ocsp_offline_good_staple(void)
+{
+    EXPECT_DECLS;
+    WOLFSSL_CERT_MANAGER* cm = NULL;
+    struct test_ocsp_offline_answer ans;
+
+    XMEMSET(&ans, 0, sizeof(ans));
+    /* The cached variant carries nextUpdate, so the second check is served
+     * from the cache rather than force-refetched. */
+    ans.resp = resp_intermediate1_good_cached;
+    ans.respSz = (int)sizeof(resp_intermediate1_good_cached);
+
+    ExpectIntEQ(test_ocsp_offline_cm(&cm, &ans), TEST_SUCCESS);
+    if (cm == NULL)
+        return EXPECT_RESULT();
+
+    /* First check: response fetched through the local callback and accepted. */
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate1_ca_cert_pem,
+                    (int)sizeof(intermediate1_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(ans.calls, 1);
+
+    /* Second check: served from the identity-bound cache, no IO. */
+    ExpectIntEQ(wolfSSL_CertManagerCheckOCSP(cm, intermediate1_ca_cert_pem,
+                    (int)sizeof(intermediate1_ca_cert_pem)),
+        WOLFSSL_SUCCESS);
+    ExpectIntEQ(ans.calls, 1);
+
+    wolfSSL_CertManagerFree(cm);
+    return EXPECT_RESULT();
+}
+#else
+int test_ocsp_offline_identity_binding(void)
+{
+    return TEST_SKIPPED;
+}
+int test_ocsp_offline_cache_identity(void)
+{
+    return TEST_SKIPPED;
+}
+int test_ocsp_offline_good_staple(void)
+{
+    return TEST_SKIPPED;
+}
+#endif /* HAVE_OCSP && !NO_SHA && !NO_RSA && !NO_FILESYSTEM && !NO_CERTS */

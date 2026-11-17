@@ -74,6 +74,9 @@ int test_ocsp_ctx_request_cache_drop_in_use(void);
 int test_ocsp_responder(void);
 int test_ocsp_ancestor_responder_rejected(void);
 int test_ocsp_forged_responder_cert_rejected(void);
+int test_ocsp_offline_identity_binding(void);
+int test_ocsp_offline_cache_identity(void);
+int test_ocsp_offline_good_staple(void);
 int test_wolfIO_DecodeUrl_crlf_reject(void);
 int test_wolfIO_DecodeUrl_host_bounds(void);
 #endif /* WOLFSSL_TEST_OCSP_H */

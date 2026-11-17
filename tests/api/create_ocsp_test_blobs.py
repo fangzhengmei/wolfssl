@@ -17,6 +17,11 @@ from cryptography.hazmat.backends import default_backend
 
 WOLFSSL_OCSP_CERT_PATH = './certs/ocsp/'
 
+# Encoded responses keyed by definition name, populated before the header is
+# written so that later definitions (e.g. replayed signatures) can borrow
+# bytes from earlier ones.
+RESPONSE_BLOBS: dict[str, bytes] = {}
+
 def response_status(value: int) -> rfc6960.OCSPResponseStatus:
     return rfc6960.OCSPResponseStatus(value)
 
@@ -181,6 +186,33 @@ def cert_id(issuer_cert_path: str, serial: int) -> rfc6960.CertID:
 
     return cert_id
 
+def cert_id_corrupt(issuer_cert_path: str, serial: int, corrupt: str) -> rfc6960.CertID:
+    """Build a CertID with one identity component deliberately wrong.
+
+    corrupt selects which field is modified:
+      'name_hash' - flip a bit in issuerNameHash,
+      'key_hash'  - flip a bit in issuerKeyHash,
+      'serial'    - replace the serial with a value no issued cert carries.
+    The response is still signed by the legitimate responder key, so the only
+    thing under test is whether wolfSSL binds the response to the CertID (and,
+    through it, the certificate) instead of trusting a verifiable signature on
+    its own.
+    """
+    cid = cert_id(issuer_cert_path, serial)
+    if corrupt == 'name_hash':
+        name_hash = bytearray(cid['issuerNameHash'].asOctets())
+        name_hash[0] ^= 0x01
+        cid['issuerNameHash'] = univ.OctetString(value=bytes(name_hash))
+    elif corrupt == 'key_hash':
+        key_hash = bytearray(cid['issuerKeyHash'].asOctets())
+        key_hash[0] ^= 0x01
+        cid['issuerKeyHash'] = univ.OctetString(value=bytes(key_hash))
+    elif corrupt == 'serial':
+        cid['serialNumber'] = rfc6960.CertificateSerialNumber(0x7FFFFFFE)
+    else:
+        raise ValueError('unknown CertID corruption: %s' % corrupt)
+    return cid
+
 CERT_GOOD = 0
 CERT_REVOKED = 1
 CERT_UNKNOWN = 2
@@ -205,24 +237,60 @@ def cert_status(value: int) -> rfc6960.CertStatus:
 
     return cs
 
+def generalized_time(dt: datetime) -> useful.GeneralizedTime:
+    useful.GeneralizedTime._hasSubsecond = False
+    return useful.GeneralizedTime().fromDateTime(dt)
+
+def next_update_time(dt: datetime) -> useful.GeneralizedTime:
+    # SingleResponse.nextUpdate is GeneralizedTime with explicit context tag 0.
+    return generalized_time(dt).subtype(explicitTag=tag.Tag(
+        tag.tagClassContext, tag.tagFormatSimple, 0))
+
 def single_response(issuer_cert_path: str, serial: int,
-                    status: int) -> rfc6960.SingleResponse:
+                    status: int, this_update: datetime | None = None,
+                    next_update: datetime | None = None) -> rfc6960.SingleResponse:
     cid = cert_id(issuer_cert_path, serial)
     cs = cert_status(status)
     sr = rfc6960.SingleResponse().clone()
     sr.setComponentByName('certID', cid)
     sr['certStatus'] = cs
-    sr['thisUpdate'] = useful.GeneralizedTime().fromDateTime(datetime.now() - timedelta(days=1))
+    if this_update is None:
+        this_update = datetime.now() - timedelta(days=1)
+    sr['thisUpdate'] = generalized_time(this_update)
+    if next_update is not None:
+        sr['nextUpdate'] = next_update_time(next_update)
+    return sr
+
+def single_response_custom_cid(cid: rfc6960.CertID, status: int,
+                               this_update: datetime | None = None,
+                               next_update: datetime | None = None) -> rfc6960.SingleResponse:
+    """Build a SingleResponse around a caller-supplied CertID.
+
+    Used by the negative binding tests that have to corrupt one half of the
+    CertID or state an update time that is already stale.
+    """
+    cs = cert_status(status)
+    sr = rfc6960.SingleResponse().clone()
+    sr.setComponentByName('certID', cid)
+    sr['certStatus'] = cs
+    if this_update is None:
+        this_update = datetime.now() - timedelta(days=1)
+    sr['thisUpdate'] = generalized_time(this_update)
+    if next_update is not None:
+        sr['nextUpdate'] = next_update_time(next_update)
     return sr
 
 def response_data(rid: rfc6960.ResponderID | None,
-                  responses: list[rfc6960.SingleResponse]) -> rfc6960.ResponseData:
+                  responses: list[rfc6960.SingleResponse],
+                  produced_at: datetime | None = None) -> rfc6960.ResponseData:
     rd = rfc6960.ResponseData()
     rd['version'] = rfc6960.Version('v1').subtype(explicitTag=tag.Tag(
         tag.tagClassContext, tag.tagFormatSimple, 0))
     if rid:
         rd['responderID'] = rid
-    rd['producedAt'] = useful.GeneralizedTime().fromDateTime(datetime.now() - timedelta(days=1))
+    if produced_at is None:
+        produced_at = datetime.now() - timedelta(days=1)
+    rd['producedAt'] = useful.GeneralizedTime().fromDateTime(produced_at)
     rs = univ.SequenceOf(componentType=rfc6960.SingleResponse())
     rs.extend(responses)
     rd['responses'] = rs
@@ -341,8 +409,14 @@ def create_response(rd: dict) -> rfc6960.OCSPResponse:
     # implement responder byhash
     responses = []
     for entry in rd.get('responses', []):
+        this_update = entry.get('this_update')
+        next_update = entry.get('next_update')
         if entry.get('certificate'):
             sr = single_response_from_cert(entry['certificate'], entry['status'])
+        elif entry.get('custom_cid') is not None:
+            # Fully caller-controlled CertID plus optional stale timestamps.
+            sr = single_response_custom_cid(entry['custom_cid'],
+                entry['status'], this_update, next_update)
         elif entry.get('name_cert') and entry.get('key_cert'):
             # Forge a CertID where issuerNameHash and issuerKeyHash are taken
             # from different certificates. Used to test that responder
@@ -355,15 +429,13 @@ def create_response(rd: dict) -> rfc6960.OCSPResponse:
             issuer_key_hash = sha1(get_key(key_cert).asOctets()).digest()
             cid = cert_id_from_hash(issuer_name_hash, issuer_key_hash,
                                     entry['serial'])
-            sr = rfc6960.SingleResponse().clone()
-            sr.setComponentByName('certID', cid)
-            sr['certStatus'] = cert_status(entry['status'])
-            sr['thisUpdate'] = useful.GeneralizedTime().fromDateTime(
-                datetime.now() - timedelta(days=1))
+            sr = single_response_custom_cid(cid, entry['status'],
+                this_update, next_update)
         else:
-            sr = single_response(entry['issuer_cert'], entry['serial'], entry['status'])
+            sr = single_response(entry['issuer_cert'], entry['serial'],
+                entry['status'], this_update, next_update)
         responses.append(sr)
-    rd_data = response_data(rid, responses)
+    rd_data = response_data(rid, responses, rd.get('produced_at'))
     k = get_priv_key(rd.get('responder_key', WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem'))
     s = sign_repsonse_data(rd_data, k)
     br = basic_ocsp_response(rd_data, sa, s, c)
@@ -372,9 +444,35 @@ def create_response(rd: dict) -> rfc6960.OCSPResponse:
     return ocspr
 
 def create_and_write_response(rd: dict, f):
-    ocspr = create_response(rd)
-    encoded_response = encode(ocspr)
+    if rd['name'] in RESPONSE_BLOBS:
+        encoded_response = RESPONSE_BLOBS[rd['name']]
+    else:
+        ocspr = create_response(rd)
+        encoded_response = encode(ocspr)
+        if rd.get('replay_sig_from') is not None:
+            encoded_response = splice_signature_from(
+                encoded_response, rd['replay_sig_from'])
     write_buffer(rd['name'].replace('-', '_').replace('.', '_'), encoded_response, f)
+
+def splice_signature_from(encoded_response: bytes, source_name: str) -> bytes:
+    """Replace the signature BIT STRING with one from another response.
+
+    Produces the "reused signature" sample: the target tbsResponseData was
+    never signed by the responder, so the transplanted signature cannot
+    verify even though the bytes themselves come from a genuine response.
+    """
+    source_der = RESPONSE_BLOBS[source_name]
+    src_outer, _ = decode(source_der, asn1Spec=rfc6960.OCSPResponse())
+    src_basic_der = src_outer['responseBytes']['response']
+    src_basic, _ = decode(src_basic_der, asn1Spec=rfc6960.BasicOCSPResponse())
+    replay_sig = src_basic['signature']
+
+    outer, _ = decode(encoded_response, asn1Spec=rfc6960.OCSPResponse())
+    basic_der = outer['responseBytes']['response']
+    basic, _ = decode(basic_der, asn1Spec=rfc6960.BasicOCSPResponse())
+    basic['signature'] = replay_sig
+    outer['responseBytes']['response'] = encode(basic)
+    return encode(outer)
 
 def add_certificate(cert_path: str, f):
     cert_der = cert_pem_to_der(cert_path)
@@ -662,7 +760,179 @@ if __name__ == '__main__':
             'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
             'name': 'resp_forged_responder_cert'
         },
+        {
+            # Validly signed response whose CertID carries a serial that no
+            # certificate issued by the root CA has. A check that matches on
+            # issuer hashes alone would bind it to whatever cert is presented;
+            # the serial comparison must reject it (CompareOcspReqResp).
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'custom_cid': cert_id_corrupt(
+                        WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                        0x01, 'serial'),
+                    'status': CERT_GOOD
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_certid_serial_mismatch'
+        },
+        {
+            # Same responder and signature as a good response, but the CertID
+            # issuerNameHash has a flipped bit. The response signature still
+            # verifies; responder authorization must reject it because the
+            # CertID no longer names the issuer.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'custom_cid': cert_id_corrupt(
+                        WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                        0x01, 'name_hash'),
+                    'status': CERT_GOOD
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_certid_namehash_mismatch'
+        },
+        {
+            # Same corruption on issuerKeyHash. Kept separate from the name
+            # hash case so a regression in either half of the CertID is
+            # attributable from the test output.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'custom_cid': cert_id_corrupt(
+                        WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                        0x01, 'key_hash'),
+                    'status': CERT_GOOD
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_certid_keyhash_corrupt'
+        },
+        {
+            # Stale response: nextUpdate is well in the past. Decode must
+            # reject it with ASN_AFTER_DATE_E rather than letting a cached
+            # "good" status outlive its validity window.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'issuer_cert': WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                    'serial': 0x01,
+                    'status': CERT_GOOD,
+                    'this_update': datetime.now() - timedelta(days=30),
+                    'next_update': datetime.now() - timedelta(days=2)
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_expired_nextupdate'
+        },
+        {
+            # Response claiming to be fresh in the future, beyond the clock
+            # skew tolerance. The thisUpdate check must reject it with
+            # ASN_BEFORE_DATE_E.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'issuer_cert': WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                    'serial': 0x01,
+                    'status': CERT_GOOD,
+                    'this_update': datetime.now() + timedelta(days=30)
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_future_thisupdate'
+        },
+        {
+            # Replayed signature: the tbsResponseData is freshly built (and its
+            # serial intentionally mismatched), but it carries the signature
+            # bytes of an unrelated, validly signed response. Signature
+            # confirmation must fail with ASN_OCSP_CONFIRM_E. The signature is
+            # spliced in after encoding by splice_signature_from() below.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'custom_cid': cert_id_corrupt(
+                        WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                        0x01, 'serial'),
+                    'status': CERT_GOOD
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'replay_sig_from': 'resp',
+            'name': 'resp_replayed_signature'
+        },
+        {
+            # Good response for intermediate1-ca (serial 01) carrying a
+            # nextUpdate 30 days out. The plain resp[] blob has thisUpdate
+            # only, which makes GetOcspStatus force a refetch; this one lets
+            # the OCSP cache actually serve a second check without IO, which
+            # the offline cache-identity tests rely on.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'issuer_cert': WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                    'serial': 0x01,
+                    'status': CERT_GOOD,
+                    'next_update': datetime.now() + timedelta(days=30)
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_intermediate1_good_cached'
+        },
+        {
+            # Good response for intermediate2-ca (serial 02), same root CA and
+            # responder as the intermediate1 response. Paired with resp[] (for
+            # serial 01) it exercises the OCSP cache: the two certs share an
+            # OcspEntry but their CertStatus entries are keyed by serial, so a
+            # response validated for one cert must never be served for the
+            # other. Carries nextUpdate so a cached status stays valid across
+            # repeated checks instead of being force-refetched.
+            'response_status': 0,
+            'signature_algorithm': signature_algorithm(),
+            'certs_path': [WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-cert.pem'],
+            'responder_by_name': True,
+            'responses': [
+                {
+                    'issuer_cert': WOLFSSL_OCSP_CERT_PATH + 'root-ca-cert.pem',
+                    'serial': 0x02,
+                    'status': CERT_GOOD,
+                    'next_update': datetime.now() + timedelta(days=30)
+                }
+            ],
+            'responder_key': WOLFSSL_OCSP_CERT_PATH + 'ocsp-responder-key.pem',
+            'name': 'resp_intermediate2_good'
+        },
     ]
+
+    # Pre-encode every response so definitions that splice bytes from earlier
+    # ones (replayed signatures) can reference them by name.
+    for rd in response_definitions:
+        encoded = encode(create_response(rd))
+        if rd.get('replay_sig_from') is not None:
+            encoded = splice_signature_from(encoded, rd['replay_sig_from'])
+        RESPONSE_BLOBS[rd['name']] = encoded
 
     with open('./tests/api/test_ocsp_test_blobs.h', 'w') as f:
         f.write(
@@ -699,6 +969,7 @@ if __name__ == '__main__':
         add_certificate(WOLFSSL_OCSP_CERT_PATH + '../ca-cert.pem', f)
         add_certificate(WOLFSSL_OCSP_CERT_PATH + '../server-cert.pem', f)
         add_certificate(WOLFSSL_OCSP_CERT_PATH + 'intermediate1-ca-cert.pem', f)
+        add_certificate(WOLFSSL_OCSP_CERT_PATH + 'intermediate2-ca-cert.pem', f)
         add_certificate(WOLFSSL_OCSP_CERT_PATH + 'imposter-root-ca-cert.pem', f)
         add_certificate(WOLFSSL_OCSP_CERT_PATH + 'server1-cert.pem', f)
         br = create_bad_response({
