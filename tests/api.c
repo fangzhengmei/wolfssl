@@ -316,6 +316,7 @@
 #include <tests/api/test_evp_cipher.h>
 #include <tests/api/test_evp_pkey.h>
 #include <tests/api/test_certman.h>
+#include <tests/api/test_der_chain.h>
 #include <tests/api/test_tls13.h>
 #include <tests/api/test_tls13_bounds.h>
 #include <tests/api/test_tls13_features.h>
@@ -48416,6 +48417,11 @@ TEST_CASE testCases[] = {
      * CertManager API tests
      *********************************/
     TEST_CERTMAN_DECLS,
+
+    /*********************************
+     * DER structural mutation / chain verification integration tests
+     *********************************/
+    TEST_DER_CHAIN_DECLS,
 
     TEST_DECL(test_wolfSSL_CheckOCSPResponse),
 
